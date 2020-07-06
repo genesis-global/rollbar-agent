@@ -196,16 +196,153 @@ def choose_processor(filename):
     return LogFileProcessor
 
 
+class Truncation(object):
+
+    MAX_PAYLOAD_SIZE = 524288  # 512 * 1024 bytes
+    FRAMES_OPTIMIZATION_RANGE = 75
+    STRING_LENGTH_THRESHOLDS = [1024, 512, 256]
+    COLLECTION_LENGTH_THRESHOLDS = [75, 50, 25]
+
+    @staticmethod
+    def needs_truncating(payload):
+        return sys.getsizeof(payload) > Truncation.MAX_PAYLOAD_SIZE
+
+    @staticmethod
+    def __select_frames(frames, opt_range=FRAMES_OPTIMIZATION_RANGE):
+        if len(frames) <= opt_range * 2:
+            return frames
+        else:
+            return frames[:opt_range] + frames[-opt_range:]
+
+    @staticmethod
+    def __recursive_shorten_strings(content, threshold):
+        # Go through each item of dict or list
+        if isinstance(content, dict):
+            collection = content.items()
+        elif isinstance(content, list):
+            collection = enumerate(content)
+        else:
+            return
+
+        for key, value in collection:
+            if isinstance(value, str) and len(value) > threshold:
+                content[key] = value[:threshold]
+            elif isinstance(value, dict) or isinstance(value, list):
+                Truncation.__recursive_shorten_strings(value, threshold)
+
+
+    @staticmethod
+    def __recursive_shorten_collections(content, threshold):
+        # Go through each item of dict or list
+        if isinstance(content, dict):
+            collection = content.items()
+        elif isinstance(content, list):
+            collection = enumerate(content)
+        else:
+            return
+
+        for key, value in collection:
+            if isinstance(value, list):
+                if len(value) > threshold:
+                    content[key] = value[:threshold]
+                Truncation.__recursive_shorten_collections(content[key], threshold)
+            elif isinstance(value, dict):
+                if len(value) > threshold:
+                    content[key] = dict(value.items()[:threshold])
+                Truncation.__recursive_shorten_collections(content[key], threshold)
+
+    @staticmethod
+    def __cut_trace_data(trace_data):
+        trace_data["exception"].pop("description", None)
+        trace_data["exception"]["message"] = trace_data["exception"]["message"][:255]
+        trace_data["frames"] = Truncation.__select_frames(trace_data.get("frames", []), 1)
+
+    @staticmethod
+    def raw_strategy(payload):
+        return payload
+
+    @staticmethod
+    def frames_strategy(payload):
+        content = json.loads(payload)
+
+        if "trace_chain" in content["data"]["body"]:
+            content["data"]["body"]["trace_chain"]["frames"] = \
+                Truncation.__select_frames(
+                    content["data"]["body"]["trace_chain"].get("frames", []),
+                    opt_range=Truncation.FRAMES_OPTIMIZATION_RANGE
+                )
+        elif "trace" in content["data"]["body"]:
+            content["data"]["body"]["trace"]["frames"] = \
+                Truncation.__select_frames(
+                    content["data"]["body"]["trace"].get("frames", []),
+                    opt_range=Truncation.FRAMES_OPTIMIZATION_RANGE
+                )
+
+        return json.dumps(content)
+
+    @staticmethod
+    def strings_strategy(payload):
+        content = json.loads(payload)
+
+        for threshold in Truncation.STRING_LENGTH_THRESHOLDS:
+            if not Truncation.needs_truncating(json.dumps(content)):
+                break
+            Truncation.__recursive_shorten_strings(content, threshold)
+
+        return json.dumps(content)
+
+    @staticmethod
+    def collections_strategy(payload):
+        content = json.loads(payload)
+
+        for threshold in Truncation.COLLECTION_LENGTH_THRESHOLDS:
+            if not Truncation.needs_truncating(json.dumps(content)):
+                break
+            Truncation.__recursive_shorten_collections(content, threshold)
+
+        return json.dumps(content)
+
+    @staticmethod
+    def min_body_strategy(payload):
+        content = json.loads(payload)
+
+        if "trace_chain" in content["data"]["body"]:
+            Truncation.__cut_trace_data(content["data"]["body"]["trace_chain"])
+        elif "trace" in content["data"]["body"]:
+            Truncation.__cut_trace_data(content["data"]["body"]["trace"])
+
+        content["data"]["body"].pop("extra", None)
+
+        return json.dumps(content)
+
+
 class Processor(object):
     """
     Base Processor class
     """
+
+    TRUNCATION_STRATEGIES = [
+        Truncation.raw_strategy,
+        Truncation.frames_strategy,
+        Truncation.strings_strategy,
+        Truncation.collections_strategy,
+        Truncation.min_body_strategy
+    ]
+
     def __init__(self, scanner, app):
         self.scanner = scanner
         self.app = app
 
     def process(self, fp):
         raise NotImplementedError()
+
+    def truncate(self, payload):        
+        for strategy in self.TRUNCATION_STRATEGIES:
+            if not Truncation.needs_truncating(payload):
+                break
+            payload = strategy(payload)
+
+        return payload
 
     def send_payload(self, payload):
         # do immediate http post
@@ -256,6 +393,7 @@ class RollbarFileProcessor(Processor):
             log.warning("Could not process badly formatted line: %s", line)
             return
 
+        line = self.truncate(line)
         self.send_payload(line)
 
 
@@ -364,6 +502,7 @@ class LogFileProcessor(Processor):
             return
 
         payload = self._build_payload(message, filename)
+        payload = self.truncate(payload)
         self.send_payload(payload)
 
     def _build_payload(self, message, filename):
